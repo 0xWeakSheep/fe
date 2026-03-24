@@ -62,8 +62,8 @@ fn yul_test_filter_limits_emitted_tests() {
 #[test]
 fn yul_test_filter_skips_unselected_invalid_tests() {
     let mut db = DriverDataBase::default();
-    let file_url = Url::from_file_path("/tmp/yul_test_filter_skips_unselected_invalid_tests.fe")
-        .expect("fixture path should be absolute");
+    let fixture_path = std::env::temp_dir().join("yul_test_filter_skips_unselected_invalid_tests.fe");
+    let file_url = Url::from_file_path(&fixture_path).expect("fixture path should be absolute");
     db.workspace().touch(
         &mut db,
         file_url.clone(),
