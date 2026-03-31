@@ -277,12 +277,9 @@ impl<'db> Callable<'db> {
         };
 
         for (i, (given, expected)) in args.into_iter().zip(expected_arg_tys.iter()).enumerate() {
-            // Only check labels when the caller explicitly provides one.
-            // If no label is provided (given.label is None), it's a positional argument.
-            if let Some(given_label) = given.label
-                && let Some(expected_label) = self.callable_def.param_label(db, i)
+            if let Some(expected_label) = self.callable_def.param_label(db, i)
                 && !expected_label.is_self(db)
-                && given_label != expected_label
+                && Some(expected_label) != given.label
             {
                 let diag = BodyDiag::CallArgLabelMismatch {
                     primary: given.label_span.unwrap_or(given.expr_span.clone()),
@@ -304,6 +301,20 @@ impl<'db> Callable<'db> {
                 .and_then(|params| params.get(i).copied())
                 .map(|param| param.mode(db));
             let given_ty = tc.normalize_ty(given.expr_prop.ty);
+            let given_string_source_ty = given
+                .expr_prop
+                .binding
+                .map(|binding| tc.normalize_ty(tc.env.lookup_binding_ty(&binding)))
+                .unwrap_or(given_ty);
+            let const_string_arg_ty = if matches!(self.callable_def, CallableDef::Func(func) if func.is_const(db))
+                && expected.is_ty_var(db)
+                && let TyData::TyVar(var) = given_string_source_ty.base_ty(db).data(db)
+                && let crate::analysis::ty::ty_def::TyVarSort::String { min_len, .. } = var.sort
+            {
+                Some(TyId::string_with_len(db, min_len))
+            } else {
+                None
+            };
             let own_capability_inner = if mode == Some(FuncParamMode::Own)
                 && !expected.is_ty_var(db)
                 && let Some((kind, inner)) = given_ty.as_capability(db)
@@ -333,6 +344,16 @@ impl<'db> Callable<'db> {
                     });
                     TyId::invalid(db, InvalidCause::Other)
                 }
+            } else if let Some(fixed_string_ty) = const_string_arg_ty {
+                if let Some(binding) = given.expr_prop.binding {
+                    tc.equate_ty(
+                        tc.env.lookup_binding_ty(&binding),
+                        fixed_string_ty,
+                        given.expr_span.clone(),
+                    );
+                }
+                tc.equate_ty(given.expr_prop.ty, fixed_string_ty, given.expr_span.clone());
+                fixed_string_ty
             } else {
                 tc.try_coerce_capability_for_expr_to_expected(
                     given.expr,
@@ -517,11 +538,7 @@ impl<'db> CallArg<'db> {
             let ty = tc.fresh_ty();
             tc.check_expr(arg.expr, ty)
         };
-        // Only use explicit labels for function calls, not inferred labels.
-        // The `label_eagerly` behavior (inferring labels from variable names) is
-        // useful for struct field initialization syntax, but for function calls
-        // we should only require a match when the user explicitly provides a label.
-        let label = arg.label;
+        let label = arg.label_eagerly(tc.db, tc.body());
         let label_span = arg.label.is_some().then(|| span.clone().label().into());
         let expr_span = span.expr().into();
 

@@ -312,7 +312,7 @@ impl<'db, 'a> MirBuilder<'db, 'a> {
 
         let dest = self.alloc_temp_local(ty, false, temp_name);
         let load_space = self.load_result_address_space(expr, ty, addr_space);
-        self.builder.body.locals[dest.index()].address_space = load_space;
+        self.set_local_address_space(dest, load_space);
         self.assign(None, Some(dest), Rvalue::Load { place });
         self.alloc_value(
             ty,
@@ -357,7 +357,7 @@ impl<'db, 'a> MirBuilder<'db, 'a> {
             let place_space = self.place_address_space(&place);
             let dest = self.alloc_temp_local(target_ty, false, "coerce");
             let load_space = self.load_result_address_space(expr, target_ty, place_space);
-            self.builder.body.locals[dest.index()].address_space = load_space;
+            self.set_local_address_space(dest, load_space);
             self.assign(None, Some(dest), Rvalue::Load { place });
             return self.alloc_value(
                 target_ty,
@@ -532,6 +532,13 @@ impl<'db, 'a> MirBuilder<'db, 'a> {
             return value;
         }
         if let Some(value) = self.try_lower_unit_variant(expr, None) {
+            let expr_value = self.ensure_value(expr);
+            self.set_expr_value_from_lowered_value(expr_value, value);
+            return value;
+        }
+        if let Partial::Present(Expr::Lit(LitKind::String(str_id))) = expr.data(self.db, self.body)
+            && let Some(value) = self.try_lower_dyn_string_literal(expr, *str_id)
+        {
             let expr_value = self.ensure_value(expr);
             self.set_expr_value_from_lowered_value(expr_value, value);
             return value;
@@ -843,7 +850,7 @@ impl<'db, 'a> MirBuilder<'db, 'a> {
 
         let dest_ty = self.typed_body.expr_ty(self.db, expr);
         let dest = self.alloc_temp_local(dest_ty, false, "checked");
-        self.builder.body.locals[dest.index()].address_space = self.expr_address_space(expr);
+        self.set_local_address_space(dest, self.expr_address_space(expr));
         self.assign_checked_intrinsic_call(None, dest, args, intrinsic, Some(expr));
         self.builder.body.values[value_id.index()].origin = ValueOrigin::Local(dest);
         value_id
@@ -1082,7 +1089,7 @@ impl<'db, 'a> MirBuilder<'db, 'a> {
             self.value_repr_for_ty(inner_ty, AddressSpaceKind::Memory),
         );
         let temp = self.alloc_temp_local(inner_ty, false, "captmp");
-        self.builder.body.locals[temp.index()].address_space = AddressSpaceKind::Memory;
+        self.set_local_address_space(temp, AddressSpaceKind::Memory);
         self.assign(None, Some(temp), Rvalue::Value(inner_value));
         let base = self.alloc_value(inner_ty, ValueOrigin::PlaceRoot(temp), ValueRepr::Word);
         Some(Place::new(base, MirProjectionPath::new()))
@@ -1162,7 +1169,7 @@ impl<'db, 'a> MirBuilder<'db, 'a> {
                         let place_space = self.place_address_space(&place);
                         let expected_repr = self.value_repr_for_ty(expected_ty, place_space);
                         let loaded = self.alloc_temp_local(required_inner, false, "viewword");
-                        self.builder.body.locals[loaded.index()].address_space = place_space;
+                        self.set_local_address_space(loaded, place_space);
                         self.assign(None, Some(loaded), Rvalue::Load { place });
                         let loaded_value = self.alloc_value(
                             required_inner,
@@ -1247,7 +1254,7 @@ impl<'db, 'a> MirBuilder<'db, 'a> {
             }
 
             let temp = self.alloc_temp_local(actual_ty, false, "viewtmp");
-            self.builder.body.locals[temp.index()].address_space = AddressSpaceKind::Memory;
+            self.set_local_address_space(temp, AddressSpaceKind::Memory);
             self.assign(None, Some(temp), Rvalue::Value(arg_value));
             let base = self.alloc_value(actual_ty, ValueOrigin::PlaceRoot(temp), ValueRepr::Word);
             let place = Place::new(base, MirProjectionPath::new());
@@ -1273,7 +1280,7 @@ impl<'db, 'a> MirBuilder<'db, 'a> {
             };
 
             let dest = self.alloc_temp_local(expected_ty, false, "copyarg");
-            self.builder.body.locals[dest.index()].address_space = self.place_address_space(&place);
+            self.set_local_address_space(dest, self.place_address_space(&place));
             self.assign(None, Some(dest), Rvalue::Load { place });
             return self.alloc_value(expected_ty, ValueOrigin::Local(dest), expected_repr);
         }
@@ -1457,7 +1464,7 @@ impl<'db, 'a> MirBuilder<'db, 'a> {
             }
 
             let temp = self.alloc_temp_local(source_ty, false, "viewtmp");
-            self.builder.body.locals[temp.index()].address_space = AddressSpaceKind::Memory;
+            self.set_local_address_space(temp, AddressSpaceKind::Memory);
             self.assign(None, Some(temp), Rvalue::Value(arg_value));
             let base = self.alloc_value(source_ty, ValueOrigin::PlaceRoot(temp), ValueRepr::Word);
             Some(Place::new(base, MirProjectionPath::new()))
@@ -1502,7 +1509,7 @@ impl<'db, 'a> MirBuilder<'db, 'a> {
         };
 
         let dest = self.alloc_temp_local(inner_ty, false, "binload");
-        self.builder.body.locals[dest.index()].address_space = AddressSpaceKind::Memory;
+        self.set_local_address_space(dest, AddressSpaceKind::Memory);
         self.assign(None, Some(dest), Rvalue::Load { place });
         self.alloc_value(
             inner_ty,
@@ -1662,7 +1669,7 @@ impl<'db, 'a> MirBuilder<'db, 'a> {
 
                     let dest =
                         dest_override.unwrap_or_else(|| self.alloc_temp_local(ty, false, "intr"));
-                    self.builder.body.locals[dest.index()].address_space = AddressSpaceKind::Memory;
+                    self.set_local_address_space(dest, AddressSpaceKind::Memory);
                     self.assign(
                         stmt,
                         Some(dest),
@@ -1703,7 +1710,7 @@ impl<'db, 'a> MirBuilder<'db, 'a> {
 
                 let dest =
                     dest_override.unwrap_or_else(|| self.alloc_temp_local(ty, false, "intr"));
-                self.builder.body.locals[dest.index()].address_space = result_space;
+                self.set_local_address_space(dest, result_space);
                 self.assign(
                     stmt,
                     Some(dest),
@@ -1741,7 +1748,7 @@ impl<'db, 'a> MirBuilder<'db, 'a> {
             None
         };
         if let Some(dest) = dest {
-            self.builder.body.locals[dest.index()].address_space = result_space;
+            self.set_local_address_space(dest, result_space);
         }
         let hir_target = crate::ir::HirCallTarget {
             callable_def: callable.callable_def,
@@ -1835,7 +1842,7 @@ impl<'db, 'a> MirBuilder<'db, 'a> {
         hint: &str,
     ) -> (ValueId, Place<'db>) {
         let addr_local = self.alloc_temp_local(ty, false, hint);
-        self.builder.body.locals[addr_local.index()].address_space = addr_space;
+        self.set_local_address_space(addr_local, addr_space);
         self.assign(
             None,
             Some(addr_local),
@@ -2069,6 +2076,13 @@ impl<'db, 'a> MirBuilder<'db, 'a> {
             && self.builder.body.spill_slots.contains_key(&local)
             && let Some(place) = self.place_for_borrow_expr(expr)
         {
+            if self.is_by_ref_ty(ty) {
+                self.builder.body.values[value_id.index()].origin = ValueOrigin::PlaceRef(place);
+                self.builder.body.values[value_id.index()].repr =
+                    self.value_repr_for_expr(expr, ty);
+                return value_id;
+            }
+
             let dest = self.alloc_temp_local(ty, false, "spill");
             self.assign(None, Some(dest), Rvalue::Load { place });
             self.builder.body.values[value_id.index()].origin = ValueOrigin::Local(dest);
@@ -2084,7 +2098,7 @@ impl<'db, 'a> MirBuilder<'db, 'a> {
             && let Some(place) = self.place_for_borrow_expr(expr)
         {
             let dest = self.alloc_temp_local(ty, false, "addrload");
-            self.builder.body.locals[dest.index()].address_space = self.place_address_space(&place);
+            self.set_local_address_space(dest, self.place_address_space(&place));
             self.assign(None, Some(dest), Rvalue::Load { place });
             self.builder.body.values[value_id.index()].origin = ValueOrigin::Local(dest);
             self.builder.body.values[value_id.index()].repr = ValueRepr::Word;
@@ -2147,7 +2161,7 @@ impl<'db, 'a> MirBuilder<'db, 'a> {
             return value_id;
         };
         let dest = self.alloc_temp_local(ty, false, "load");
-        self.builder.body.locals[dest.index()].address_space = self.expr_address_space(expr);
+        self.set_local_address_space(dest, self.expr_address_space(expr));
         self.assign(None, Some(dest), Rvalue::Load { place });
         self.builder.body.values[value_id.index()].origin = ValueOrigin::Local(dest);
         self.builder.body.values[value_id.index()].repr = ValueRepr::Word;
@@ -2377,7 +2391,7 @@ impl<'db, 'a> MirBuilder<'db, 'a> {
         if self.current_block().is_none() {
             return Some(dest);
         }
-        self.builder.body.locals[dest.index()].address_space = self.expr_address_space(expr);
+        self.set_local_address_space(dest, self.expr_address_space(expr));
 
         let region_val = self.alloc_value(
             array_ty,
@@ -2778,8 +2792,7 @@ impl<'db, 'a> MirBuilder<'db, 'a> {
         let lhs_value = match &root_lvalue {
             RootLvalue::Place(place) => {
                 let loaded_local = self.alloc_temp_local(lhs_place_ty, false, "load");
-                self.builder.body.locals[loaded_local.index()].address_space =
-                    self.expr_address_space(target);
+                self.set_local_address_space(loaded_local, self.expr_address_space(target));
                 self.assign(
                     None,
                     Some(loaded_local),
@@ -2819,8 +2832,7 @@ impl<'db, 'a> MirBuilder<'db, 'a> {
                     );
                     if let Some(place) = self.place_from_derefable_value(base_value, lhs_ty) {
                         let loaded_local = self.alloc_temp_local(lhs_place_ty, false, "load");
-                        self.builder.body.locals[loaded_local.index()].address_space =
-                            self.expr_address_space(target);
+                        self.set_local_address_space(loaded_local, self.expr_address_space(target));
                         self.assign(None, Some(loaded_local), Rvalue::Load { place });
                         self.alloc_value(
                             lhs_place_ty,
@@ -2851,7 +2863,7 @@ impl<'db, 'a> MirBuilder<'db, 'a> {
             };
 
             let dest = self.alloc_temp_local(lhs_place_ty, false, "checked");
-            self.builder.body.locals[dest.index()].address_space = self.expr_address_space(target);
+            self.set_local_address_space(dest, self.expr_address_space(target));
             self.assign_checked_intrinsic_call(
                 Some(stmt_id),
                 dest,
@@ -3018,8 +3030,7 @@ impl<'db, 'a> MirBuilder<'db, 'a> {
 
         if let Some(place) = writeback_place {
             let updated_local = self.alloc_temp_local(target_ty, false, "aug_assign");
-            self.builder.body.locals[updated_local.index()].address_space =
-                self.expr_address_space(target);
+            self.set_local_address_space(updated_local, self.expr_address_space(target));
             self.assign(None, Some(updated_local), Rvalue::Load { place });
             let updated = self.alloc_value(
                 target_ty,
@@ -3536,7 +3547,7 @@ impl<'db, 'a> MirBuilder<'db, 'a> {
         // Create a local for the result
         let result_local = self.alloc_temp_local(elem_ty, false, "seq_get");
         if let ValueRepr::Ref(space) = repr {
-            self.builder.body.locals[result_local.index()].address_space = space;
+            self.set_local_address_space(result_local, space);
         }
 
         let mut receiver_space = None;
@@ -4504,10 +4515,16 @@ struct CellMover {
 }
 
 impl CellMover {
-    fn bump(mut self, by: u256) -> u256 {
+    fn bump(mut self, _ by: u256) -> u256 {
         self.cell.value += by
         self.cell.value
     }
+}
+
+fn entry() -> u256 {
+    let mut cell = Cell { value: 1 }
+    let mut mover = CellMover { cell: mut cell, tag: 0 }
+    mover.bump(3)
 }
 "#;
 
@@ -4579,7 +4596,7 @@ impl CellMover {
         let url =
             Url::parse("file:///resolved_place_keeps_empty_handle_roots_as_values.fe").unwrap();
         let src = r#"
-fn forward(value: mut u256) -> mut u256 {
+fn forward(_ value: mut u256) -> mut u256 {
     value
 }
 
@@ -4651,7 +4668,7 @@ fn entry() -> u256 {
         let url =
             Url::parse("file:///scalar_loads_from_handle_roots_use_explicit_deref.fe").unwrap();
         let src = r#"
-fn forward(value: mut u256) -> mut u256 {
+fn forward(_ value: mut u256) -> mut u256 {
     value
 }
 
@@ -4845,7 +4862,7 @@ pub fn borrow_handles_readback() -> u256 {
         let mut db = DriverDataBase::default();
         let url = Url::parse("file:///aug_assign_through_handle_local_stays_a_store.fe").unwrap();
         let src = r#"
-fn forward(value: mut u256) -> mut u256 {
+fn forward(_ value: mut u256) -> mut u256 {
     value
 }
 
@@ -4911,7 +4928,7 @@ fn entry() -> u256 {
         let mut db = DriverDataBase::default();
         let url = Url::parse("file:///place_ref_values_keep_handle_pointer_metadata.fe").unwrap();
         let src = r#"
-fn forward(value: mut u256) -> mut u256 {
+fn forward(_ value: mut u256) -> mut u256 {
     value
 }
 

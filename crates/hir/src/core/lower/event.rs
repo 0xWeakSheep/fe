@@ -284,11 +284,7 @@ fn parse_event_fields<'db>(
 
         let ty_ref = TypeId::lower_ast_partial(ctxt, field.ty());
 
-        let vis = if field.pub_kw().is_some() {
-            Visibility::Public
-        } else {
-            Visibility::Private
-        };
+        let vis = super::lower_field_visibility(&field);
 
         hir_fields.push(FieldDef::new(attrs, name_ident, ty_ref, vis));
 
@@ -471,6 +467,8 @@ fn lower_emit_method<'db>(
 
     let emit_ident = builder.ident("emit");
     let log_provider_ident = builder.ident("log");
+    let offset_ident = builder.ident("offset");
+    let len_ident = builder.ident("len");
     let enc_ident = builder.ident("enc");
     let data_len_ident = builder.ident("data_len");
     let data_ptr_ident = builder.ident("data_ptr");
@@ -492,7 +490,7 @@ fn lower_emit_method<'db>(
     let log_param_ty = TypeId::new(db, TypeKind::Mode(TypeMode::Mut, Partial::Present(log_ty)));
 
     let self_param = FuncParam {
-        mode: FuncParamMode::View,
+        mode: FuncParamMode::Own,
         is_mut: false,
         has_ref_prefix: false,
         has_own_prefix: false,
@@ -507,7 +505,7 @@ fn lower_emit_method<'db>(
         is_mut: false,
         has_ref_prefix: false,
         has_own_prefix: false,
-        is_label_suppressed: false,
+        is_label_suppressed: true,
         name: Partial::Present(FuncParamName::Ident(log_provider_ident)),
         ty: Partial::Present(log_param_ty),
         self_ty_fallback: false,
@@ -603,18 +601,30 @@ fn lower_emit_method<'db>(
                 body.path_expr(path)
             };
             let mut args = Vec::with_capacity(3 + indexed_fields.len());
-            args.push(data_ptr);
-            args.push(data_len);
-            args.push(topic0);
+            args.push(crate::hir_def::expr::CallArg {
+                label: Some(offset_ident),
+                expr: data_ptr,
+            });
+            args.push(crate::hir_def::expr::CallArg {
+                label: Some(len_ident),
+                expr: data_len,
+            });
+            args.push(crate::hir_def::expr::CallArg {
+                label: Some(IdentId::new(db, "topic0".to_string())),
+                expr: topic0,
+            });
 
             for (name, _ty) in indexed_fields.iter().copied() {
                 let value = self_field_expr(body, self_expr, name);
                 let topic = body.method_call_expr(value, as_topic_ident, vec![]);
-                args.push(topic);
+                args.push(crate::hir_def::expr::CallArg {
+                    label: Some(IdentId::new(db, format!("topic{}", args.len() - 2))),
+                    expr: topic,
+                });
             }
 
             let log_expr = body.ident_expr(log_provider_ident);
-            let log_call = body.method_call_expr(log_expr, log_method_ident, args);
+            let log_call = body.method_call_expr_with_args(log_expr, log_method_ident, args);
             body.emit_expr_stmt(log_call);
         },
     );

@@ -181,6 +181,7 @@ impl<'db, 'a> MirBuilder<'db, 'a> {
 
         let ty = self.typed_body.expr_ty(self.db, expr);
         if let Partial::Present(Expr::Lit(LitKind::String(str_id))) = expr.data(self.db, self.body)
+            && !self.is_core_dyn_string_ty(ty)
         {
             match self.alloc_bytes_value(ty, str_id.data(self.db).as_bytes().to_vec()) {
                 Ok(value_id) => {
@@ -894,7 +895,7 @@ impl<'db, 'a> MirBuilder<'db, 'a> {
         self.current_block()?;
 
         let dest = self.alloc_temp_local(array_ty, false, "const_array");
-        self.builder.body.locals[dest.index()].address_space = AddressSpaceKind::Memory;
+        self.set_local_address_space(dest, AddressSpaceKind::Memory);
 
         self.push_inst_here(MirInst::Assign {
             source: crate::ir::SourceInfoId::SYNTHETIC,

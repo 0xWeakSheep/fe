@@ -1,7 +1,7 @@
 use super::{
     adt_def::AdtCycleMember,
     trait_def::TraitInstId,
-    ty_check::{RecordLike, TraitOps},
+    ty_check::{ConcreteBorrowProvider, RecordLike, TraitOps},
     ty_def::{BorrowKind, CapabilityKind, Kind, TyId},
 };
 use crate::visitor::prelude::*;
@@ -370,6 +370,13 @@ pub enum BodyDiag<'db> {
         func: Option<CallableDef<'db>>,
     },
 
+    IncompatibleBorrowProviders {
+        primary: DynLazySpan<'db>,
+        previous: DynLazySpan<'db>,
+        previous_provider: ConcreteBorrowProvider,
+        current_provider: ConcreteBorrowProvider,
+    },
+
     TypeMustBeKnown(DynLazySpan<'db>),
     ConstValueMustBeKnown(DynLazySpan<'db>),
 
@@ -609,6 +616,22 @@ pub enum BodyDiag<'db> {
         handler_ty: TyId<'db>,
     },
 
+    /// A fallback arm `_` is only allowed in a bare recv block.
+    RecvFallbackOnlyInBareBlock {
+        primary: DynLazySpan<'db>,
+    },
+
+    /// At most one fallback arm may exist in a contract.
+    RecvDuplicateFallback {
+        primary: DynLazySpan<'db>,
+        first_use: DynLazySpan<'db>,
+    },
+
+    /// Fallback arms are unit-returning and may not declare `-> T`.
+    RecvFallbackReturnTypeNotAllowed {
+        primary: DynLazySpan<'db>,
+    },
+
     // Const fn / const-check diagnostics -----------------------------------
     ConstFnEffectsNotAllowed(DynLazySpan<'db>),
     ConstFnWithNotAllowed(DynLazySpan<'db>),
@@ -731,6 +754,7 @@ impl<'db> BodyDiag<'db> {
             Self::WithEffectTypeUnsatisfied { .. } => 76,
             Self::AmbiguousEffect { .. } => 40,
             Self::ReturnedTypeMismatch { .. } => 13,
+            Self::IncompatibleBorrowProviders { .. } => 77,
             Self::TypeMustBeKnown(..) => 14,
             Self::InvalidCast { .. } => 55,
             Self::ConstValueMustBeKnown(..) => 64,
@@ -774,6 +798,9 @@ impl<'db> BodyDiag<'db> {
             Self::RecvArmNotVariantOfMsg { .. } => 48,
             Self::RecvArmNotMsgVariantTrait { .. } => 49,
             Self::RecvDuplicateHandler { .. } => 50,
+            Self::RecvFallbackOnlyInBareBlock { .. } => 78,
+            Self::RecvDuplicateFallback { .. } => 79,
+            Self::RecvFallbackReturnTypeNotAllowed { .. } => 80,
             Self::ConstFnEffectsNotAllowed(_) => 55,
             Self::ConstFnWithNotAllowed(_) => 56,
             Self::ConstFnLoopNotAllowed(_) => 57,

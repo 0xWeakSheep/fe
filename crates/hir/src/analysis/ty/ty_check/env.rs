@@ -1,8 +1,8 @@
 use crate::{
     analysis::place::Place,
     hir_def::{
-        BinOp, Body, Contract, Expr, ExprId, Func, IdentId, IntegerId, ItemKind, Partial, Pat,
-        PatId, PathId, Stmt, StmtId, UnOp, prim_ty::PrimTy, scope_graph::ScopeId,
+        BinOp, Body, Contract, Expr, ExprId, Func, IdentId, ItemKind, Partial, Pat, PatId, PathId,
+        Stmt, StmtId, UnOp, scope_graph::ScopeId,
     },
     span::DynLazySpan,
 };
@@ -10,7 +10,6 @@ use crate::{
 use crate::hir_def::CallableDef;
 use crate::hir_def::params::FuncParamMode;
 use common::indexmap::IndexMap;
-use num_bigint::BigUint;
 use rustc_hash::{FxHashMap, FxHashSet};
 use salsa::Update;
 use thin_vec::ThinVec;
@@ -24,7 +23,7 @@ use crate::analysis::ty::pattern_ir::{
 use crate::analysis::{
     HirAnalysisDb,
     ty::{
-        const_ty::{ConstTyData, ConstTyId, EvaluatedConstTy},
+        corelib::resolve_lib_type_path,
         effects::{
             EffectKeyKind,
             elaborate::{build_pattern_from_requirement_decl, seed_forwarder_from_requirement},
@@ -41,7 +40,7 @@ use crate::analysis::{
             },
         },
         ty_contains_const_hole,
-        ty_def::{InvalidCause, TyData, TyId, TyVarSort},
+        ty_def::{InvalidCause, StringFallback, TyData, TyId, TyVarSort},
         ty_lower::lower_hir_ty,
         unify::UnificationTable,
     },
@@ -75,6 +74,7 @@ pub(crate) struct TyCheckEnv<'db> {
     param_bindings: Vec<LocalBinding<'db>>,
     /// Pat bindings for transfer to TypedBody
     pat_bindings: FxHashMap<PatId, LocalBinding<'db>>,
+    local_borrow_providers: FxHashMap<PatId, ConcreteBorrowProvider>,
     /// Binding capture mode for local variables (keyed by the pattern that introduces them)
     pat_binding_modes: FxHashMap<PatId, PatBindingMode>,
     pattern_store: PatternStore<'db>,
@@ -200,6 +200,7 @@ impl<'db> TyCheckEnv<'db> {
             expr_stack: Vec::new(),
             param_bindings: Vec::new(),
             pat_bindings: FxHashMap::default(),
+            local_borrow_providers: FxHashMap::default(),
             pat_binding_modes: FxHashMap::default(),
             pattern_store: PatternStore::default(),
             pattern_status: FxHashMap::default(),
@@ -349,7 +350,7 @@ impl<'db> TyCheckEnv<'db> {
             .map(|(contract, site)| (contract, EffectEnvView::new(site)))
     }
 
-    fn semantic_effect_binding(
+    pub(super) fn semantic_effect_binding(
         &self,
         site: EffectParamSite<'db>,
         idx: usize,
@@ -578,6 +579,22 @@ impl<'db> TyCheckEnv<'db> {
         self.pat_bindings.get(&pat).copied()
     }
 
+    pub(super) fn local_borrow_provider(&self, pat: PatId) -> Option<ConcreteBorrowProvider> {
+        self.local_borrow_providers.get(&pat).copied()
+    }
+
+    pub(super) fn set_local_borrow_provider(
+        &mut self,
+        pat: PatId,
+        provider: Option<ConcreteBorrowProvider>,
+    ) {
+        if let Some(provider) = provider {
+            self.local_borrow_providers.insert(pat, provider);
+        } else {
+            self.local_borrow_providers.remove(&pat);
+        }
+    }
+
     pub(super) fn set_pat_binding_mode(&mut self, pat: PatId, mode: PatBindingMode) {
         if self.pat_bindings.contains_key(&pat) {
             self.pat_binding_modes.insert(pat, mode);
@@ -588,6 +605,7 @@ impl<'db> TyCheckEnv<'db> {
         let Some(binding) = self.pat_bindings.remove(&pat) else {
             return;
         };
+        self.local_borrow_providers.remove(&pat);
         self.pat_binding_modes.remove(&pat);
         self.pending_vars.retain(|_, pending| *pending != binding);
     }
@@ -767,7 +785,10 @@ impl<'db> TyCheckEnv<'db> {
     /// the unification table.
     ///
     pub(super) fn finish(mut self, table: &mut UnificationTable<'db>) -> TypedBody<'db> {
-        let mut prober = Prober { table };
+        let mut prober = Prober {
+            table,
+            scope: self.scope(),
+        };
 
         self.expr_ty
             .values_mut()
@@ -1190,6 +1211,7 @@ pub struct ExprProp<'db> {
     pub ty: TyId<'db>,
     pub is_mut: bool,
     pub binding: Option<LocalBinding<'db>>,
+    pub borrow_provider: Option<ConcreteBorrowProvider>,
 }
 
 impl<'db> ExprProp<'db> {
@@ -1198,14 +1220,7 @@ impl<'db> ExprProp<'db> {
             ty,
             is_mut,
             binding: None,
-        }
-    }
-
-    pub(super) fn new_binding_ref(ty: TyId<'db>, is_mut: bool, binding: LocalBinding<'db>) -> Self {
-        Self {
-            ty,
-            is_mut,
-            binding: Some(binding),
+            borrow_provider: None,
         }
     }
 
@@ -1214,6 +1229,26 @@ impl<'db> ExprProp<'db> {
             ty: TyId::invalid(db, InvalidCause::Other),
             is_mut: true,
             binding: None,
+            borrow_provider: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Update)]
+pub enum ConcreteBorrowProvider {
+    Memory,
+    Storage,
+    TransientStorage,
+    Calldata,
+}
+
+impl ConcreteBorrowProvider {
+    pub fn pretty(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Storage => "storage",
+            Self::TransientStorage => "transient storage",
+            Self::Calldata => "calldata",
         }
     }
 }
@@ -1270,6 +1305,15 @@ impl<'db> LocalBinding<'db> {
                 path.ident(hir_db).unwrap()
             }
 
+            Self::Param {
+                site: ParamSite::EffectField(effect_site),
+                idx,
+                ..
+            } => env
+                .semantic_effect_binding(*effect_site, *idx)
+                .map(|binding| binding.binding_name)
+                .or_else(|| param_name(env.db, ParamSite::EffectField(*effect_site), *idx))
+                .unwrap_or_else(|| IdentId::new(env.db, "_".to_string())),
             Self::Param { site, idx, .. } => param_name(env.db, *site, *idx)
                 .unwrap_or_else(|| IdentId::new(env.db, "_".to_string())),
             Self::EffectParam { key_path, .. } => key_path
@@ -1307,11 +1351,12 @@ impl<'db> LocalBinding<'db> {
 
 pub(super) struct Prober<'db, 'a> {
     table: &'a mut UnificationTable<'db>,
+    scope: ScopeId<'db>,
 }
 
 impl<'db, 'a> Prober<'db, 'a> {
-    pub(super) fn new(table: &'a mut UnificationTable<'db>) -> Self {
-        Self { table }
+    pub(super) fn new(table: &'a mut UnificationTable<'db>, scope: ScopeId<'db>) -> Self {
+        Self { table, scope }
     }
 }
 
@@ -1323,12 +1368,14 @@ impl<'db> TyFolder<'db> for Prober<'db, '_> {
         };
 
         // String type variable fallback.
-        if let TyVarSort::String(len) = var.sort {
-            let ty = TyId::new(db, TyData::TyBase(PrimTy::String.into()));
-            let len = EvaluatedConstTy::LitInt(IntegerId::new(db, BigUint::from(len)));
-            let len = ConstTyData::Evaluated(len, ty.applicable_ty(db).unwrap().const_ty.unwrap());
-            let len = TyId::const_ty(db, ConstTyId::new(db, len));
-            TyId::app(db, ty, len)
+        if let TyVarSort::String { min_len, fallback } = var.sort {
+            match fallback {
+                StringFallback::Dynamic => {
+                    resolve_lib_type_path(db, self.scope, "core::abi::DynString")
+                        .unwrap_or_else(|| TyId::string_with_len(db, min_len))
+                }
+                StringFallback::Fixed => TyId::string_with_len(db, min_len),
+            }
         } else {
             ty.super_fold_with(db, self)
         }

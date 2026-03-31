@@ -35,7 +35,9 @@ use callable::{CallGenericArgUnifyError, unify_explicit_call_generic_args};
 use common::indexmap::IndexMap;
 use ena::unify::InPlace;
 use env::TyCheckEnv;
-pub use env::{EffectParamSite, ExprProp, LocalBinding, ParamSite, PatBindingMode};
+pub use env::{
+    ConcreteBorrowProvider, EffectParamSite, ExprProp, LocalBinding, ParamSite, PatBindingMode,
+};
 pub(super) use expr::TraitOps;
 pub use owner::BodyOwner;
 pub use owner::EffectParamOwner;
@@ -44,7 +46,7 @@ pub use stmt::ForLoopSeq;
 use rustc_hash::{FxHashMap, FxHashSet};
 use salsa::Update;
 
-use crate::analysis::place::Place;
+use crate::analysis::place::{Place, PlaceBase};
 
 use super::{
     assoc_const::AssocConstUse,
@@ -60,13 +62,14 @@ use super::{
         is_goal_query_satisfiable, is_goal_satisfiable,
     },
     ty_contains_const_hole,
-    ty_def::{BorrowKind, CapabilityKind, InvalidCause, Kind, TyId, TyVarSort},
+    ty_def::{BorrowKind, CapabilityKind, InvalidCause, Kind, StringFallback, TyId, TyVarSort},
     ty_lower::lower_hir_ty,
     unify::{InferenceKey, Snapshot, UnificationError, UnificationTable},
 };
 use crate::analysis::ty::ty_def::{TyBase, TyData};
 use crate::analysis::ty::{
     const_ty::ConstTyData,
+    corelib::resolve_lib_type_path,
     ctfe::{CtfeConfig, CtfeInterpreter},
     fold::AssocTySubst,
     normalize::normalize_ty,
@@ -160,6 +163,7 @@ pub struct TyChecker<'db> {
     pub(crate) table: UnificationTable<'db>,
     expected: TyId<'db>,
     effect_provider_keys: FxHashSet<InferenceKey<'db>>,
+    first_return_borrow_provider: Option<(DynLazySpan<'db>, ConcreteBorrowProvider)>,
     diags: Vec<FuncBodyDiag<'db>>,
 }
 
@@ -186,6 +190,10 @@ enum CallConstraintBoundOwner<'db> {
 }
 
 impl<'db> TyChecker<'db> {
+    fn string_literal_fallback(&self) -> StringFallback {
+        StringFallback::Fixed
+    }
+
     fn new(db: &'db dyn HirAnalysisDb, owner: BodyOwner<'db>) -> Result<Self, ()> {
         let env = TyCheckEnv::new(db, owner)?;
         let expected = env.compute_expected_return();
@@ -462,6 +470,141 @@ impl<'db> TyChecker<'db> {
 
     fn commit_state(&mut self, snapshot: TyCheckerSnapshot<'db>) {
         self.table.commit(snapshot.table);
+    }
+
+    fn concrete_borrow_provider_from_address_space(
+        &self,
+        address_space: TyId<'db>,
+    ) -> Option<ConcreteBorrowProvider> {
+        let scope = self.env.scope();
+        let memory = resolve_lib_type_path(self.db, scope, "core::effect_ref::Memory")?;
+        let storage = resolve_lib_type_path(self.db, scope, "core::effect_ref::Storage")?;
+        let transient =
+            resolve_lib_type_path(self.db, scope, "core::effect_ref::TransientStorage")?;
+        let calldata = resolve_lib_type_path(self.db, scope, "core::effect_ref::Calldata")?;
+
+        if address_space == memory {
+            Some(ConcreteBorrowProvider::Memory)
+        } else if address_space == storage {
+            Some(ConcreteBorrowProvider::Storage)
+        } else if address_space == transient {
+            Some(ConcreteBorrowProvider::TransientStorage)
+        } else if address_space == calldata {
+            Some(ConcreteBorrowProvider::Calldata)
+        } else {
+            None
+        }
+    }
+
+    fn concrete_borrow_provider_for_effect_field(
+        &self,
+        site: EffectParamSite<'db>,
+        idx: usize,
+    ) -> Option<ConcreteBorrowProvider> {
+        let contract = match site {
+            EffectParamSite::Func(_) => return None,
+            EffectParamSite::Contract(contract)
+            | EffectParamSite::ContractInit { contract }
+            | EffectParamSite::ContractRecvArm { contract, .. } => contract,
+        };
+        let name = self.env.semantic_effect_binding(site, idx)?.binding_name;
+        let field = contract.field_layout(self.db).get(&name)?;
+        self.concrete_borrow_provider_from_address_space(field.address_space)
+    }
+
+    fn concrete_borrow_provider_for_contract_name(
+        &self,
+        site: EffectParamSite<'db>,
+        name: crate::hir_def::IdentId<'db>,
+    ) -> Option<ConcreteBorrowProvider> {
+        let contract = match site {
+            EffectParamSite::Func(_) => return None,
+            EffectParamSite::Contract(contract)
+            | EffectParamSite::ContractInit { contract }
+            | EffectParamSite::ContractRecvArm { contract, .. } => contract,
+        };
+        if let Some(field) = contract.field_layout(self.db).get(&name) {
+            return self.concrete_borrow_provider_from_address_space(field.address_space);
+        }
+        let root_effect_ty = super::resolve_default_root_effect_ty(
+            self.db,
+            contract.scope(),
+            self.env.base_assumptions(),
+        )?;
+        self.concrete_borrow_provider_from_address_space(root_effect_ty)
+    }
+
+    fn concrete_borrow_provider_for_binding(
+        &self,
+        binding: LocalBinding<'db>,
+    ) -> Option<ConcreteBorrowProvider> {
+        match binding {
+            LocalBinding::Local { pat, .. } => self.env.local_borrow_provider(pat),
+            LocalBinding::EffectParam { site, .. } => self
+                .concrete_borrow_provider_for_contract_name(site, binding.binding_name(&self.env)),
+            LocalBinding::Param {
+                site: ParamSite::EffectField(site),
+                idx,
+                ..
+            } => self
+                .concrete_borrow_provider_for_effect_field(site, idx)
+                .or_else(|| {
+                    self.concrete_borrow_provider_for_contract_name(
+                        site,
+                        binding.binding_name(&self.env),
+                    )
+                }),
+            _ => None,
+        }
+    }
+
+    fn concrete_borrow_provider_for_place(
+        &self,
+        place: &Place<'db>,
+    ) -> Option<ConcreteBorrowProvider> {
+        let PlaceBase::Binding(binding) = place.base;
+        if self
+            .env
+            .lookup_binding_ty(&binding)
+            .as_capability(self.db)
+            .is_some()
+        {
+            return self.concrete_borrow_provider_for_binding(binding);
+        }
+
+        match binding {
+            LocalBinding::EffectParam { .. } => self.concrete_borrow_provider_for_binding(binding),
+            LocalBinding::Param {
+                site: ParamSite::EffectField(..),
+                ..
+            } => self.concrete_borrow_provider_for_binding(binding),
+            LocalBinding::Local { .. } | LocalBinding::Param { .. } => {
+                Some(ConcreteBorrowProvider::Memory)
+            }
+        }
+    }
+
+    fn merge_concrete_borrow_providers(
+        &mut self,
+        previous_span: DynLazySpan<'db>,
+        previous: Option<ConcreteBorrowProvider>,
+        current_span: DynLazySpan<'db>,
+        current: Option<ConcreteBorrowProvider>,
+    ) -> Option<ConcreteBorrowProvider> {
+        if let (Some(previous), Some(current)) = (previous, current)
+            && previous != current
+        {
+            self.push_diag(BodyDiag::IncompatibleBorrowProviders {
+                primary: current_span,
+                previous: previous_span,
+                previous_provider: previous,
+                current_provider: current,
+            });
+        }
+
+        previous
+            .zip(current)
+            .and_then(|(previous, current)| (previous == current).then_some(previous))
     }
 
     fn has_dead_inference_keys<T>(&self, value: &T) -> bool
@@ -889,7 +1032,7 @@ impl<'db> TyChecker<'db> {
 
             let result = (|| {
                 let recv_ty = {
-                    let mut prober = env::Prober::new(&mut this.table);
+                    let mut prober = env::Prober::new(&mut this.table, scope);
                     pending.recv_ty.fold_with(db, &mut prober)
                 };
 
@@ -998,7 +1141,7 @@ impl<'db> TyChecker<'db> {
                             continue;
                         };
                         let expr_ty = {
-                            let mut prober = env::Prober::new(&mut self.table);
+                            let mut prober = env::Prober::new(&mut self.table, scope);
                             expr_prop.ty.fold_with(db, &mut prober)
                         };
                         if expr_ty.has_invalid(db) {
@@ -1033,7 +1176,7 @@ impl<'db> TyChecker<'db> {
                                     .typed_expr(receiver)
                                     .unwrap_or_else(|| ExprProp::invalid(db));
                                 let recv_ty = {
-                                    let mut prober = env::Prober::new(&mut self.table);
+                                    let mut prober = env::Prober::new(&mut self.table, scope);
                                     pending.recv_ty.fold_with(db, &mut prober)
                                 };
 
@@ -1123,7 +1266,7 @@ impl<'db> TyChecker<'db> {
                         continue;
                     };
                     let expr_ty = {
-                        let mut prober = env::Prober::new(&mut self.table);
+                        let mut prober = env::Prober::new(&mut self.table, scope);
                         expr_prop.ty.fold_with(db, &mut prober)
                     };
                     if expr_ty.has_invalid(db) {
@@ -1177,6 +1320,7 @@ impl<'db> TyChecker<'db> {
             table,
             expected,
             effect_provider_keys: FxHashSet::default(),
+            first_return_borrow_provider: None,
             diags: Vec::new(),
         }
     }
@@ -1192,6 +1336,10 @@ impl<'db> TyChecker<'db> {
         arm_span: crate::span::item::LazyRecvArmSpan<'db>,
     ) -> (TyId<'db>, TyId<'db>) {
         let invalid_ty = TyId::invalid(self.db, InvalidCause::Other);
+
+        if arm.is_fallback(self.db) {
+            return (TyId::unit(self.db), TyId::unit(self.db));
+        }
 
         // Get variant path from arm pattern
         let Some(variant_path) = arm.variant_path(self.db) else {
@@ -1475,8 +1623,13 @@ impl<'db> TyChecker<'db> {
             LitKind::Int(_) => self.table.new_var(TyVarSort::Integral, &Kind::Star),
             LitKind::String(s) => {
                 let len_bytes = s.len_bytes(self.db);
-                self.table
-                    .new_var(TyVarSort::String(len_bytes), &Kind::Star)
+                self.table.new_var(
+                    TyVarSort::String {
+                        min_len: len_bytes,
+                        fallback: self.string_literal_fallback(),
+                    },
+                    &Kind::Star,
+                )
             }
         }
     }
@@ -1542,6 +1695,14 @@ impl<'db> TyChecker<'db> {
 
     fn capability_fallback_candidates(&self, ty: TyId<'db>) -> Vec<TyId<'db>> {
         let mut candidates = vec![ty];
+        if let TyData::TyVar(var) = ty.base_ty(self.db).data(self.db)
+            && matches!(var.sort, TyVarSort::String { .. })
+            && let Some(text_ty) =
+                resolve_lib_type_path(self.db, self.env.scope(), "core::abi::DynString")
+        {
+            candidates.push(text_ty);
+            candidates.push(TyId::view_of(self.db, text_ty));
+        }
         if let Some((cap, inner)) = ty.as_capability(self.db) {
             if matches!(cap, CapabilityKind::Mut) {
                 candidates.push(TyId::borrow_ref_of(self.db, inner));

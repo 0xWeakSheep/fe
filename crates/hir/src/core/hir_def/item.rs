@@ -909,6 +909,13 @@ impl<'db> ContractRecvArm<'db> {
         }
     }
 
+    pub fn is_fallback(&self, db: &'db dyn HirDb) -> bool {
+        matches!(
+            self.pat.data(db, self.body),
+            Partial::Present(Pat::WildCard)
+        )
+    }
+
     /// Returns `true` if this recv arm is marked `#[payable]`.
     pub fn is_payable(&self, db: &'db dyn HirDb) -> bool {
         self.attributes.has_marker_attr(db, "payable")
@@ -1540,11 +1547,18 @@ pub enum VariantKind<'db> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Visibility {
+    /// Unrestricted public visibility.
     Public,
+    /// Private to the defining scope.
     Private,
+    /// `pub(ingot)` — visible within the same ingot (like Rust's `pub(crate)`).
+    PubIngot,
+    /// `pub(super)` — visible within the parent module.
+    PubSuper,
 }
 
 impl Visibility {
+    /// Returns true only for unrestricted `pub`.
     pub fn is_pub(self) -> bool {
         self == Self::Public
     }

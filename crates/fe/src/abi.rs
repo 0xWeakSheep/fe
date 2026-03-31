@@ -187,9 +187,26 @@ fn recv_arm_to_abi_entry(
     arm_view: hir::semantic::RecvArmView<'_>,
     sol_ty: TyId<'_>,
 ) -> Result<RecvArmAbiEmission, String> {
-    arm_view
+    let arm = arm_view
         .arm(db)
         .ok_or_else(|| "missing recv arm during ABI generation".to_string())?;
+    let abi_info = arm_view.abi_info(db, sol_ty);
+
+    if abi_info.is_fallback {
+        return Ok(RecvArmAbiEmission::Emit(AbiEntry {
+            entry_type: "fallback".to_string(),
+            name: None,
+            inputs: None,
+            outputs: None,
+            state_mutability: Some(if arm.is_payable(db) {
+                "payable".to_string()
+            } else {
+                "nonpayable".to_string()
+            }),
+            anonymous: None,
+        }));
+    }
+
     let variant_ty = arm_view.variant_ty(db);
     let variant_struct = struct_from_ty(db, variant_ty).ok_or_else(|| {
         format!(
@@ -207,7 +224,6 @@ fn recv_arm_to_abi_entry(
             "skipping recv arm `{variant_name}`: ABI shape is not compiler-known for manual `MsgVariant` impls; only `msg`-generated variants are emitted"
         )));
     }
-    let abi_info = arm_view.abi_info(db, sol_ty);
     let Some(selector_signature) = abi_info.selector_signature.as_deref() else {
         return Ok(RecvArmAbiEmission::Skip(format!(
             "skipping recv arm `{variant_name}`: selector signature is unknown; \
@@ -652,6 +668,19 @@ fn semantic_ty_to_abi_desc(db: &DriverDataBase, ty: TyId<'_>) -> Result<AbiTypeD
         return Ok(elem_desc.array(&len));
     }
 
+    if let Some(elem_ty) = core_dyn_array_elem_ty(db, ty) {
+        let elem_desc = semantic_ty_to_abi_desc(db, elem_ty)?;
+        return Ok(elem_desc.array(""));
+    }
+
+    if is_core_dyn_string_ty(db, ty) {
+        return Ok(AbiTypeDesc::simple("string"));
+    }
+
+    if is_core_bytes_ty(db, ty) {
+        return Ok(AbiTypeDesc::simple("bytes"));
+    }
+
     if ty.is_string(db) {
         return Ok(AbiTypeDesc::simple("string"));
     }
@@ -752,6 +781,72 @@ fn is_std_address_ty(db: &DriverDataBase, ty: TyId<'_>, adt_ref: AdtRef<'_>) -> 
     }
     ty.ingot(db)
         .is_some_and(|ingot| ingot.kind(db) == IngotKind::Std)
+}
+
+fn core_dyn_array_elem_ty<'db>(db: &'db DriverDataBase, ty: TyId<'db>) -> Option<TyId<'db>> {
+    if let Some((_, inner)) = ty.as_capability(db) {
+        return core_dyn_array_elem_ty(db, inner);
+    }
+
+    let (base, args) = ty.decompose_ty_app(db);
+    let TyData::TyBase(TyBase::Adt(adt)) = base.data(db) else {
+        return None;
+    };
+    let adt_ref = adt.adt_ref(db);
+    let name = adt_ref.name(db)?;
+    if name.data(db) != "DynArray" {
+        return None;
+    }
+    if !base
+        .ingot(db)
+        .is_some_and(|ingot| ingot.kind(db) == IngotKind::Core)
+    {
+        return None;
+    }
+
+    args.first().copied()
+}
+
+fn is_core_bytes_ty(db: &DriverDataBase, ty: TyId<'_>) -> bool {
+    if let Some((_, inner)) = ty.as_capability(db) {
+        return is_core_bytes_ty(db, inner);
+    }
+
+    let base = ty.base_ty(db);
+    let TyData::TyBase(TyBase::Adt(adt)) = base.data(db) else {
+        return false;
+    };
+    let adt_ref = adt.adt_ref(db);
+    let Some(name) = adt_ref.name(db) else {
+        return false;
+    };
+    if name.data(db) != "Bytes" {
+        return false;
+    }
+
+    base.ingot(db)
+        .is_some_and(|ingot| ingot.kind(db) == IngotKind::Core)
+}
+
+fn is_core_dyn_string_ty(db: &DriverDataBase, ty: TyId<'_>) -> bool {
+    if let Some((_, inner)) = ty.as_capability(db) {
+        return is_core_dyn_string_ty(db, inner);
+    }
+
+    let base = ty.base_ty(db);
+    let TyData::TyBase(TyBase::Adt(adt)) = base.data(db) else {
+        return false;
+    };
+    let adt_ref = adt.adt_ref(db);
+    let Some(name) = adt_ref.name(db) else {
+        return false;
+    };
+    if name.data(db) != "DynString" {
+        return false;
+    }
+
+    base.ingot(db)
+        .is_some_and(|ingot| ingot.kind(db) == IngotKind::Core)
 }
 
 /// Recognise `std::abi::sol` SolCompat wrapper types like `Uint160` / `Int24`
@@ -1644,6 +1739,40 @@ pub contract Wallet {
         assert_eq!(fund["stateMutability"], "payable");
         assert_eq!(peek["stateMutability"], "pure");
         assert_eq!(peek["outputs"][0]["type"], "uint256");
+    }
+
+    #[test]
+    fn fallback_recv_arm_emits_standard_fallback_abi_entry() {
+        let code = r#"
+use std::abi::sol
+
+msg WalletMsg {
+    #[selector = sol("peek()")]
+    Peek -> u256,
+}
+
+pub contract Wallet {
+    recv {
+        WalletMsg::Peek {} -> u256 {
+            7
+        }
+
+        #[payable]
+        _ {}
+    }
+}
+"#;
+
+        let entries = abi_entries(code, "Wallet");
+        let fallback = entries
+            .iter()
+            .find(|entry| entry["type"] == "fallback")
+            .expect("fallback entry");
+
+        assert_eq!(fallback["stateMutability"], "payable");
+        assert!(fallback.get("name").is_none());
+        assert!(fallback.get("inputs").is_none());
+        assert!(fallback.get("outputs").is_none());
     }
 
     #[test]

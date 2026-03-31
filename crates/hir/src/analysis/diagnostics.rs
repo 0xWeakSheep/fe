@@ -2881,6 +2881,37 @@ impl DiagnosticVoucher for BodyDiag<'_> {
                     error_code,
                 }
             }
+            Self::IncompatibleBorrowProviders {
+                primary,
+                previous,
+                previous_provider,
+                current_provider,
+            } => CompleteDiagnostic {
+                severity: Severity::Error,
+                message: "incompatible borrow providers".to_string(),
+                sub_diagnostics: vec![
+                    SubDiagnostic {
+                        style: LabelStyle::Primary,
+                        message: format!(
+                            "this borrow is {}-backed",
+                            current_provider.pretty()
+                        ),
+                        span: primary.resolve(db),
+                    },
+                    SubDiagnostic {
+                        style: LabelStyle::Secondary,
+                        message: format!(
+                            "the previous value here is {}-backed",
+                            previous_provider.pretty()
+                        ),
+                        span: previous.resolve(db),
+                    },
+                ],
+                notes: vec![
+                    "Fe cannot assign or join `mut`/`ref` values backed by different providers into one value".to_string(),
+                ],
+                error_code,
+            },
             Self::TypeMustBeKnown(span) => CompleteDiagnostic {
                 severity: Severity::Error,
                 message: "type must be known".to_string(),
@@ -3916,6 +3947,58 @@ impl DiagnosticVoucher for BodyDiag<'_> {
                     notes: vec![
                         "each message type can only be handled once in a contract".to_string(),
                     ],
+                    error_code,
+                }
+            }
+            BodyDiag::RecvFallbackOnlyInBareBlock { primary } => {
+                let sub_diagnostics = vec![SubDiagnostic {
+                    style: LabelStyle::Primary,
+                    message: "fallback arm `_` is only allowed in `recv { ... }`".to_string(),
+                    span: primary.resolve(db),
+                }];
+                CompleteDiagnostic {
+                    severity,
+                    message: "fallback arm is only allowed in a bare recv block".to_string(),
+                    sub_diagnostics,
+                    notes: vec![
+                        "named recv blocks remain exhaustive over their declared msg root"
+                            .to_string(),
+                    ],
+                    error_code,
+                }
+            }
+            BodyDiag::RecvDuplicateFallback { primary, first_use } => {
+                let sub_diagnostics = vec![
+                    SubDiagnostic {
+                        style: LabelStyle::Primary,
+                        message: "duplicate fallback arm".to_string(),
+                        span: primary.resolve(db),
+                    },
+                    SubDiagnostic {
+                        style: LabelStyle::Secondary,
+                        message: "first fallback arm declared here".to_string(),
+                        span: first_use.resolve(db),
+                    },
+                ];
+                CompleteDiagnostic {
+                    severity,
+                    message: "duplicate fallback arm".to_string(),
+                    sub_diagnostics,
+                    notes: vec!["a contract can define at most one fallback arm".to_string()],
+                    error_code,
+                }
+            }
+            BodyDiag::RecvFallbackReturnTypeNotAllowed { primary } => {
+                let sub_diagnostics = vec![SubDiagnostic {
+                    style: LabelStyle::Primary,
+                    message: "remove the return type from this fallback arm".to_string(),
+                    span: primary.resolve(db),
+                }];
+                CompleteDiagnostic {
+                    severity,
+                    message: "fallback arm cannot declare a return type".to_string(),
+                    sub_diagnostics,
+                    notes: vec!["fallback arms are unit-returning in this version".to_string()],
                     error_code,
                 }
             }

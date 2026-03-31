@@ -6,7 +6,7 @@ use smallvec1::SmallVec;
 
 use crate::core::hir_def::{
     ArithBinOp, BinOp, CallableDef, Cond, CondId, Expr, ExprId, FieldIndex, IdentId, IntegerId,
-    LitKind, LogicalBinOp, Partial, PatId, PathId, UnOp, VariantKind, WithBinding,
+    LitKind, LogicalBinOp, Partial, PatId, PathId, Stmt, UnOp, VariantKind, WithBinding,
 };
 use crate::span::DynLazySpan;
 
@@ -291,7 +291,7 @@ impl<'db> TyChecker<'db> {
 
         self.env.enter_expr(expr);
         let mut actual = match expr_data {
-            Expr::Lit(lit) => ExprProp::new(self.lit_ty(lit), true),
+            Expr::Lit(lit) => ExprProp::new(self.lit_ty_for_expected(lit, expected), true),
             Expr::Block(..) => self.check_block(expr, expr_data, expected),
             Expr::Un(..) => self.check_unary(expr, expr_data),
             Expr::Cast(inner, ty) => self.check_cast(expr, *inner, *ty),
@@ -347,6 +347,13 @@ impl<'db> TyChecker<'db> {
         self.check_expr(expr, t)
     }
 
+    fn lit_ty_for_expected(&mut self, lit: &LitKind<'db>, expected: TyId<'db>) -> TyId<'db> {
+        match lit {
+            LitKind::String(_) if expected.is_core_dyn_string(self.db) => expected,
+            _ => self.lit_ty(lit),
+        }
+    }
+
     fn check_block(
         &mut self,
         expr: ExprId,
@@ -370,12 +377,18 @@ impl<'db> TyChecker<'db> {
             let res = if expected == TyId::unit(self.db) {
                 let ty = self.fresh_ty();
                 self.check_stmt(last_stmt, ty);
-                TyId::unit(self.db)
+                ExprProp::new(TyId::unit(self.db), true)
             } else {
-                self.check_stmt(last_stmt, expected)
+                match self.env.stmt_data(last_stmt) {
+                    Partial::Present(Stmt::Expr(expr)) => self.check_expr(*expr, expected),
+                    Partial::Present(_) => {
+                        ExprProp::new(self.check_stmt(last_stmt, expected), true)
+                    }
+                    Partial::Absent => ExprProp::invalid(self.db),
+                }
             };
             self.env.leave_scope();
-            ExprProp::new(res, true)
+            res
         }
     }
 
@@ -414,9 +427,18 @@ impl<'db> TyChecker<'db> {
                 .as_capability(self.db)
                 .map(|(_, inner)| inner)
                 .unwrap_or(prop.ty);
+            let borrow_provider = self
+                .env
+                .expr_place(*lhs)
+                .and_then(|place| self.concrete_borrow_provider_for_place(&place));
 
             return match op {
-                UnOp::Ref => ExprProp::new(TyId::borrow_ref_of(self.db, place_ty), false),
+                UnOp::Ref => ExprProp {
+                    ty: TyId::borrow_ref_of(self.db, place_ty),
+                    is_mut: false,
+                    binding: None,
+                    borrow_provider,
+                },
                 UnOp::Mut => {
                     if !prop.is_mut {
                         let binding = self.find_base_binding(*lhs).map(|binding| {
@@ -428,7 +450,12 @@ impl<'db> TyChecker<'db> {
                         });
                         return ExprProp::invalid(self.db);
                     }
-                    ExprProp::new(TyId::borrow_mut_of(self.db, place_ty), true)
+                    ExprProp {
+                        ty: TyId::borrow_mut_of(self.db, place_ty),
+                        is_mut: true,
+                        binding: None,
+                        borrow_provider,
+                    }
                 }
                 _ => unreachable!(),
             };
@@ -601,7 +628,23 @@ impl<'db> TyChecker<'db> {
             return false;
         }
 
+        if self.is_string_word_cast(from_leaf, to_leaf) {
+            return true;
+        }
+
         self.is_lossless_int_cast(from_leaf, to_leaf)
+    }
+
+    fn is_string_word_cast(&self, from: TyId<'db>, to: TyId<'db>) -> bool {
+        (from.is_string(self.db) && self.is_plain_u256(to))
+            || (self.is_plain_u256(from) && to.is_string(self.db))
+    }
+
+    fn is_plain_u256(&self, ty: TyId<'db>) -> bool {
+        matches!(
+            ty.base_ty(self.db).data(self.db),
+            TyData::TyBase(TyBase::Prim(PrimTy::U256))
+        )
     }
 
     fn transparent_newtype_field_ty(&self, ty: TyId<'db>) -> Option<TyId<'db>> {
@@ -820,7 +863,7 @@ impl<'db> TyChecker<'db> {
             return PendingPrimitiveOpResolution::Done;
         };
         let expr_ty = {
-            let mut prober = super::env::Prober::new(&mut self.table);
+            let mut prober = super::env::Prober::new(&mut self.table, self.env.scope());
             expr_prop.ty.fold_with(self.db, &mut prober)
         };
         if expr_ty.has_invalid(self.db) {
@@ -833,7 +876,7 @@ impl<'db> TyChecker<'db> {
                     return PendingPrimitiveOpResolution::Done;
                 };
                 let operand_ty = {
-                    let mut prober = super::env::Prober::new(&mut self.table);
+                    let mut prober = super::env::Prober::new(&mut self.table, self.env.scope());
                     inner_prop.ty.fold_with(self.db, &mut prober)
                 };
                 let operand_ty = operand_ty
@@ -879,11 +922,11 @@ impl<'db> TyChecker<'db> {
                     return PendingPrimitiveOpResolution::Done;
                 };
                 let lhs_ty = {
-                    let mut prober = super::env::Prober::new(&mut self.table);
+                    let mut prober = super::env::Prober::new(&mut self.table, self.env.scope());
                     lhs_prop.ty.fold_with(self.db, &mut prober)
                 };
                 let rhs_ty = {
-                    let mut prober = super::env::Prober::new(&mut self.table);
+                    let mut prober = super::env::Prober::new(&mut self.table, self.env.scope());
                     rhs_prop.ty.fold_with(self.db, &mut prober)
                 };
                 let lhs_ty = lhs_ty
@@ -2690,7 +2733,10 @@ impl<'db> TyChecker<'db> {
             method_assumptions,
             None,
         );
-        if matches!(candidate, Err(MethodSelectionError::NotFound)) {
+        if matches!(
+            candidate,
+            Err(MethodSelectionError::NotFound | MethodSelectionError::ReceiverTypeMustBeKnown)
+        ) {
             for &receiver_ty in receiver_tys.iter().skip(1) {
                 let fallback_canonical = Canonicalized::new(self.db, receiver_ty);
                 let fallback = select_method_candidate(
@@ -2902,7 +2948,12 @@ impl<'db> TyChecker<'db> {
                         CapabilityKind::View => binding.is_mut(),
                     };
                 }
-                ExprProp::new_binding_ref(ty, is_mut, binding)
+                ExprProp {
+                    ty,
+                    is_mut,
+                    binding: Some(binding),
+                    borrow_provider: self.concrete_borrow_provider_for_binding(binding),
+                }
             }
             ResolvedPathInBody::NewBinding(ident) => {
                 let diag = BodyDiag::UndefinedVariable(path_expr_span.into(), ident);
@@ -3515,15 +3566,27 @@ impl<'db> TyChecker<'db> {
         self.env.enter_lexical_scope();
         self.check_cond(*cond);
 
-        let ty = match else_ {
+        match else_ {
             Some(else_) => {
                 self.env.enter_scope(*then);
                 self.env.flush_pending_bindings();
-                self.check_expr(*then, expected);
+                let then_prop = self.check_expr(*then, expected);
                 self.env.leave_scope();
                 self.env.clear_pending_bindings();
                 self.env.leave_scope();
-                self.check_expr_in_new_scope(*else_, expected).ty
+                let else_prop = self.check_expr_in_new_scope(*else_, expected);
+                let borrow_provider = self.merge_concrete_borrow_providers(
+                    then.span(self.body()).into(),
+                    then_prop.borrow_provider,
+                    else_.span(self.body()).into(),
+                    else_prop.borrow_provider,
+                );
+                ExprProp {
+                    ty: else_prop.ty,
+                    is_mut: true,
+                    binding: None,
+                    borrow_provider,
+                }
             }
 
             None => {
@@ -3535,11 +3598,9 @@ impl<'db> TyChecker<'db> {
                 self.env.leave_scope();
                 self.env.clear_pending_bindings();
                 self.env.leave_scope();
-                TyId::unit(self.db)
+                ExprProp::new(TyId::unit(self.db), true)
             }
-        };
-
-        ExprProp::new(ty, true)
+        }
     }
 
     fn check_match(
@@ -3561,6 +3622,9 @@ impl<'db> TyChecker<'db> {
         };
 
         let mut match_ty = expected;
+        let mut first_provider: Option<(DynLazySpan<'db>, super::ConcreteBorrowProvider)> = None;
+        let mut provider_unknown = false;
+        let mut provider_conflict = false;
         let mut arm_statuses = Vec::with_capacity(arms.len());
 
         for arm in arms.iter() {
@@ -3572,14 +3636,34 @@ impl<'db> TyChecker<'db> {
 
             self.env.enter_scope(arm.body);
             self.env.flush_pending_bindings();
-            match_ty = self.check_expr(arm.body, match_ty).ty;
+            let arm_prop = self.check_expr(arm.body, match_ty);
+            match_ty = arm_prop.ty;
             self.env.leave_scope();
+
+            if arm_prop.ty.as_capability(self.db).is_some() {
+                if let Some(provider) = arm_prop.borrow_provider {
+                    if let Some((ref span, previous)) = first_provider {
+                        provider_conflict |= self
+                            .merge_concrete_borrow_providers(
+                                span.clone(),
+                                Some(previous),
+                                arm.body.span(self.body()).into(),
+                                Some(provider),
+                            )
+                            .is_none();
+                    } else {
+                        first_provider = Some((arm.body.span(self.body()).into(), provider));
+                    }
+                } else {
+                    provider_unknown = true;
+                }
+            }
         }
 
         if !scrutinee_pat_ty.has_invalid(self.db)
             && arm_statuses.iter().all(|status| status.is_ready())
         {
-            let mut prober = super::env::Prober::new(&mut self.table);
+            let mut prober = super::env::Prober::new(&mut self.table, self.env.scope());
             let pattern_store = self
                 .env
                 .pattern_store()
@@ -3623,7 +3707,16 @@ impl<'db> TyChecker<'db> {
             }
         }
 
-        ExprProp::new(match_ty, true)
+        ExprProp {
+            ty: match_ty,
+            is_mut: true,
+            binding: None,
+            borrow_provider: if provider_unknown || provider_conflict {
+                None
+            } else {
+                first_provider.map(|(_, provider)| provider)
+            },
+        }
     }
 
     fn check_assign(&mut self, _expr: ExprId, expr_data: &Expr<'db>) -> ExprProp<'db> {
@@ -3637,10 +3730,29 @@ impl<'db> TyChecker<'db> {
             .as_capability(self.db)
             .map(|(_, inner)| inner)
             .unwrap_or(typed_lhs.ty);
-        let rhs_prop = self.check_expr(*rhs, lhs_ty);
+        let mut rhs_prop = self.check_expr_unknown(*rhs);
+        if let Some(coerced) =
+            self.try_coerce_capability_for_expr_to_expected(*rhs, rhs_prop.ty, lhs_ty)
+        {
+            rhs_prop.ty = coerced;
+        }
+        rhs_prop.ty = self.unify_ty(Typeable::Expr(*rhs, rhs_prop.clone()), rhs_prop.ty, lhs_ty);
 
         self.check_assign_lhs(*lhs, &typed_lhs);
         self.record_implicit_move_for_owned_expr(*rhs, rhs_prop.ty);
+
+        if typed_lhs.ty.as_capability(self.db).is_some()
+            && let Some(place) = self.env.expr_place(*lhs)
+            && place.projections.is_empty()
+        {
+            let PlaceBase::Binding(binding) = place.base;
+            self.merge_concrete_borrow_providers(
+                binding.def_span(&self.env),
+                self.concrete_borrow_provider_for_binding(binding),
+                rhs.span(self.body()).into(),
+                rhs_prop.borrow_provider,
+            );
+        }
 
         ExprProp::new(TyId::unit(self.db), true)
     }
@@ -3714,7 +3826,10 @@ impl<'db> TyChecker<'db> {
             method_assumptions,
             Some(trait_def),
         );
-        if matches!(method_candidate, Err(MethodSelectionError::NotFound)) {
+        if matches!(
+            method_candidate,
+            Err(MethodSelectionError::NotFound | MethodSelectionError::ReceiverTypeMustBeKnown)
+        ) {
             for &candidate_ty in lhs_candidates.iter().skip(1) {
                 let c_candidate_ty = Canonicalized::new(self.db, candidate_ty);
                 let fallback = select_method_candidate(
