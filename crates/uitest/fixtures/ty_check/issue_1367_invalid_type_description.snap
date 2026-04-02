@@ -10,12 +10,6 @@ error[2-0002]: `Item` is not found
 27 │     fn get(ref self, i: usize) -> ref Item {
    │                                       ^^^^ `Item` is not found
 
-error[8-0000]: type mismatch
-   ┌─ issue_1367_invalid_type_description.fe:28:9
-   │
-28 │         self.source[self.start + I]
-   │         ^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `ref _`, but `u256` is given
-
 error[8-0012]: undefined variable
    ┌─ issue_1367_invalid_type_description.fe:28:34
    │
