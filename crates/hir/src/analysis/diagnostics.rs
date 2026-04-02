@@ -66,7 +66,7 @@ fn pretty_print_ty_for_mismatch<'db>(db: &'db dyn SpannedHirAnalysisDb, ty: TyId
         }
         TyData::ConstTy(_) => ty.pretty_print(db).to_string(),
         TyData::Never => "!".to_string(),
-        TyData::Invalid(cause) => format!("invalid({})", cause.pretty_print(db)),
+        TyData::Invalid(_) => "_".to_string(),
     }
 }
 
@@ -142,9 +142,21 @@ fn format_type_mismatch_message<'db>(
     expected: TyId<'db>,
     given: TyId<'db>,
 ) -> String {
-    let expected_plain = expected.pretty_print(db);
-    let given_plain = given.pretty_print(db);
+    let expected_plain = if expected.has_invalid(db) {
+        pretty_print_ty_for_mismatch(db, expected)
+    } else {
+        expected.pretty_print(db).to_string()
+    };
+    let given_plain = if given.has_invalid(db) {
+        pretty_print_ty_for_mismatch(db, given)
+    } else {
+        given.pretty_print(db).to_string()
+    };
     if expected_plain != given_plain {
+        return format!("expected `{expected_plain}`, but `{given_plain}` is given");
+    }
+
+    if expected.has_invalid(db) || given.has_invalid(db) {
         return format!("expected `{expected_plain}`, but `{given_plain}` is given");
     }
 
